@@ -20,6 +20,33 @@ The session system lives primarily in two modules:
 
 ---
 
+## Codex app-server process lifecycle
+
+A durable Hermes conversation and a live Codex process are intentionally
+separate lifetimes. The gateway persists the Codex thread id in the session's
+model configuration, but it keeps the Node/Rust/MCP process tree only while a
+turn is running:
+
+1. A turn creates one `CodexAppServerSession` and either starts a new Codex
+   thread or resumes the persisted thread id.
+2. The completed turn persists the returned thread id before delivery.
+3. At the outer gateway turn boundary, after queued follow-ups and post-turn
+   hooks finish, the gateway detaches and closes the app-server before
+   releasing the turn lease.
+4. POSIX app-servers run in a dedicated process group; close sends TERM and
+   then KILL to the complete group so MCP and code-mode grandchildren cannot
+   survive their owner.
+5. Startup errors, timeouts, interrupts, cache eviction, session reset, and
+   gateway shutdown all converge on the same idempotent close path.
+6. The next message rebuilds only the process runtime and resumes the durable
+   provider thread. The Hermes transcript, terminal sandbox, memory provider,
+   and conversation identity remain intact.
+
+This cold-between-turns policy prevents one resident Codex stack per cached
+conversation. Operators on constrained hosts should also set
+`max_concurrent_sessions: 1`; that caps simultaneous live process trees, while
+thread persistence preserves normal multi-conversation continuity.
+
 ## 1. SessionSource — Message Origin Descriptor
 
 `SessionSource` is a frozen record of *where a message came from*. It is attached to every
