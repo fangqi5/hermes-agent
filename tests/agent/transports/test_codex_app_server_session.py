@@ -162,6 +162,57 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
+    def test_resumes_persisted_thread_without_starting_replacement(self):
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/resume":
+                assert params == {"threadId": "thread-saved-001"}
+                return {"thread": {"id": "thread-saved-001"}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client._request_handler = handle
+        s = make_session(client, resume_thread_id="thread-saved-001")
+
+        assert s.ensure_started() == "thread-saved-001"
+        assert [method for method, _ in client.requests] == ["thread/resume"]
+
+    def test_missing_persisted_thread_starts_replacement(self):
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/resume":
+                raise session_mod.CodexAppServerError(
+                    code=-32602, message="thread not found"
+                )
+            if method == "thread/start":
+                return {"thread": {"id": "thread-replacement"}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client._request_handler = handle
+        s = make_session(client, resume_thread_id="thread-missing")
+
+        assert s.ensure_started() == "thread-replacement"
+        assert [method for method, _ in client.requests] == [
+            "thread/resume",
+            "thread/start",
+        ]
+
+    def test_non_missing_resume_failure_does_not_lose_context(self):
+        client = FakeClient()
+
+        def handle(method, params):
+            raise session_mod.CodexAppServerError(
+                code=-32000, message="authentication failed"
+            )
+
+        client._request_handler = handle
+        s = make_session(client, resume_thread_id="thread-saved-001")
+
+        with pytest.raises(session_mod.CodexAppServerError):
+            s.ensure_started()
+        assert [method for method, _ in client.requests] == ["thread/resume"]
+
     def test_thread_start_passes_cwd_only(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`
         on this codex version (experimentalApi-gated + requires matching

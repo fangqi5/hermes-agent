@@ -5050,6 +5050,18 @@ class AIAgent:
         except Exception:
             pass
 
+        # Codex app-server is a per-agent client resource, not durable session
+        # state. The provider thread id is persisted separately, so a rebuilt
+        # agent can resume without keeping the Node/Rust/MCP process tree
+        # resident after a cache eviction.
+        try:
+            codex_session = getattr(self, "_codex_session", None)
+            if codex_session is not None:
+                self._codex_session = None
+                codex_session.close()
+        except Exception:
+            pass
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 

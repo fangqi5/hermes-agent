@@ -148,6 +148,9 @@ def test_codex_turn_persists_each_message_exactly_once():
             effective_task_id="task-1",
         )
         assert result["agent_persisted"] is True
+        assert db.get_session_model_config_value(
+            sid, "_codex_app_server_thread_id"
+        ) == "thread-1"
 
         rows = db.get_messages(sid, include_inactive=True)
         contents = [r["content"] for r in rows]

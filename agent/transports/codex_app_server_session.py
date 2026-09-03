@@ -92,6 +92,20 @@ class TurnResult:
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
+_MISSING_THREAD_ERROR_HINTS = (
+    "thread not found",
+    "unknown thread",
+    "no rollout found",
+    "thread does not exist",
+)
+
+
+def _is_missing_thread_error(error: CodexAppServerError) -> bool:
+    """Return whether a saved Codex thread is no longer available."""
+    details = f"{error.message} {error.data or ''}".lower()
+    return any(hint in details for hint in _MISSING_THREAD_ERROR_HINTS)
+
+
 def _notification_scope_ids(
     note: dict,
 ) -> tuple[Optional[str], Optional[str]]:
@@ -280,6 +294,7 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        resume_thread_id: Optional[str] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
@@ -294,6 +309,11 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._resume_thread_id = (
+            resume_thread_id.strip()
+            if isinstance(resume_thread_id, str) and resume_thread_id.strip()
+            else None
+        )
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -342,8 +362,34 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        lifecycle_action = "started"
+        if self._resume_thread_id is not None:
+            try:
+                result = self._client.request(
+                    "thread/resume",
+                    {"threadId": self._resume_thread_id},
+                    timeout=15,
+                )
+                lifecycle_action = "resumed"
+            except CodexAppServerError as exc:
+                # Manual Codex cleanup can remove a persisted thread. Only
+                # that case may create a replacement; auth/transport failures
+                # stay visible instead of silently losing provider context.
+                if not _is_missing_thread_error(exc):
+                    raise
+                logger.warning(
+                    "saved codex app-server thread is unavailable; "
+                    "starting a replacement (id=%s)",
+                    self._resume_thread_id[:8],
+                )
+                result = self._client.request(
+                    "thread/start", {"cwd": self._cwd}, timeout=15
+                )
+                lifecycle_action = "started replacement"
+        else:
+            result = self._client.request(
+                "thread/start", {"cwd": self._cwd}, timeout=15
+            )
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -359,13 +405,14 @@ class CodexAppServerSession:
             raise CodexAppServerError(
                 code=-32603,
                 message=(
-                    "codex thread/start returned no thread id "
+                    "codex thread lifecycle returned no thread id "
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            lifecycle_action,
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,

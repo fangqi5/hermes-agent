@@ -225,6 +225,33 @@ class TestExtractCacheBustingConfig:
         assert out["tools.registry_generation"] == 12345
 
 
+class TestCodexGatewayParking:
+    """Codex process trees live only for the duration of a gateway turn."""
+
+    def test_turn_boundary_parks_codex_without_evicting_agent(self):
+        runner = _make_runner()
+        session_key = "feishu:thread-1"
+        codex_session = MagicMock()
+        agent = MagicMock()
+        agent._codex_session = codex_session
+        runner._agent_cache[session_key] = (agent, "sig")
+
+        assert runner._park_cached_codex_app_server(session_key) is True
+
+        assert runner._agent_cache[session_key][0] is agent
+        assert agent._codex_session is None
+        codex_session.close.assert_called_once_with()
+
+    def test_turn_boundary_parking_is_idempotent(self):
+        runner = _make_runner()
+        session_key = "feishu:thread-1"
+        agent = MagicMock()
+        agent._codex_session = None
+        runner._agent_cache[session_key] = (agent, "sig")
+
+        assert runner._park_cached_codex_app_server(session_key) is False
+
+
 class TestAgentCacheLifecycle:
     """End-to-end cache behavior with real AIAgent construction."""
 
@@ -686,6 +713,25 @@ class TestAgentCacheIdleResume:
             f"tabs and cookies gone on resume. Calls: {browser_calls}"
         )
 
+
+    def test_release_clients_parks_codex_process_tree(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model="gpt-5.3-codex", api_key="test",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider="openai-codex", api_mode="codex_app_server",
+            max_iterations=5, quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+            session_id="codex-soft-evict",
+        )
+        codex_session = MagicMock()
+        agent._codex_session = codex_session
+
+        agent.release_clients()
+
+        assert agent._codex_session is None
+        codex_session.close.assert_called_once_with()
 
     def test_close_vs_release_full_teardown_difference(self, monkeypatch):
         """close() tears down task state; release_clients() does not.

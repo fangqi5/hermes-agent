@@ -680,6 +680,53 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+_CODEX_APP_SERVER_THREAD_ID_KEY = "_codex_app_server_thread_id"
+
+
+def _load_codex_app_server_thread_id(agent: Any) -> str | None:
+    """Load the Codex thread bound to this durable Hermes session."""
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is None or not session_id:
+        return None
+    try:
+        value = session_db.get_session_model_config_value(
+            session_id, _CODEX_APP_SERVER_THREAD_ID_KEY
+        )
+    except Exception:
+        logger.warning(
+            "codex app-server thread-id load failed (session=%s)",
+            session_id,
+            exc_info=True,
+        )
+        return None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _persist_codex_app_server_thread_id(agent: Any, thread_id: Any) -> None:
+    """Persist a thread binding so a parked app-server can resume later."""
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return
+    normalized = thread_id.strip()
+    if getattr(agent, "_codex_persisted_thread_id", None) == normalized:
+        return
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is None or not session_id:
+        return
+    try:
+        session_db.patch_session_model_config(
+            session_id, {_CODEX_APP_SERVER_THREAD_ID_KEY: normalized}
+        )
+        agent._codex_persisted_thread_id = normalized
+    except Exception:
+        logger.warning(
+            "codex app-server thread-id persistence failed (session=%s)",
+            session_id,
+            exc_info=True,
+        )
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -759,9 +806,13 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        resume_thread_id = _load_codex_app_server_thread_id(agent)
+        if resume_thread_id is not None:
+            agent._codex_persisted_thread_id = resume_thread_id
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
+            resume_thread_id=resume_thread_id,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
                 auto_approve_apply_patch=auto_approve_requests,
@@ -811,6 +862,8 @@ def run_codex_app_server_turn(
             ),
             "error": str(exc),
         }
+
+    _persist_codex_app_server_thread_id(agent, turn.thread_id)
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a

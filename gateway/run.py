@@ -19899,6 +19899,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
             self._release_running_agent_state(_quick_key)
+            # A Codex app-server is needed only while a gateway turn is live.
+            # Park it before releasing the turn lease: the provider thread id
+            # is durable, so the next turn resumes it in a fresh lightweight
+            # subprocess instead of accumulating one Node/Rust/MCP tree per
+            # cached conversation.
+            await asyncio.to_thread(
+                self._park_cached_codex_app_server, _quick_key
+            )
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
@@ -29669,6 +29677,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         self._commit_memory_before_soft_evict(agent, key)
         self._release_evicted_agent_soft(agent)
+
+    def _park_cached_codex_app_server(self, session_key: str) -> bool:
+        """Close one idle cached Codex runtime while keeping session state.
+
+        The gateway persists the Codex thread id in SessionDB, so the next turn
+        can reconnect with ``thread/resume``. This method runs at the outer
+        turn boundary, before the lease is released, which prevents a new turn
+        from racing a half-closed process. It deliberately keeps the AIAgent,
+        transcript, prompt metadata, terminal sandbox, and memory provider.
+        """
+        cache = getattr(self, "_agent_cache", None)
+        lock = getattr(self, "_agent_cache_lock", None)
+        if cache is None or lock is None or not session_key:
+            return False
+        codex_session = None
+        with lock:
+            entry = cache.get(session_key)
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            if agent is None or agent is _AGENT_PENDING_SENTINEL:
+                return False
+            codex_session = getattr(agent, "_codex_session", None)
+            if codex_session is None:
+                return False
+            # Detach under the cache lock; perform subprocess teardown after
+            # releasing it because close() may wait for graceful termination.
+            agent._codex_session = None
+        try:
+            codex_session.close()
+        except Exception:
+            logger.warning(
+                "Failed to park Codex app-server for session %s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+        logger.info("Parked Codex app-server for idle session %s", session_key)
+        return True
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
