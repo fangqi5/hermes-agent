@@ -6,7 +6,10 @@ start a fresh discussion budget. Expiration never reopens a bot-only loop.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows: fail peer admission closed, preserve human chats.
+    fcntl = None
 import hashlib
 import json
 import os
@@ -35,6 +38,8 @@ class PeerDiscussionGuard:
 
     @contextmanager
     def _state(self):
+        if fcntl is None:
+            raise OSError("persistent peer locking is unavailable on this platform")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.with_suffix(".lock").open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)

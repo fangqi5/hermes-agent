@@ -14,10 +14,6 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-A2A_REQUEST_MARKER = "[A2A_REQUEST]"
-A2A_RESULT_MARKER = "[A2A_RESULT]"
-
-
 @dataclass(frozen=True)
 class A2ABot:
     key: str
@@ -134,16 +130,6 @@ def allows_peer_message(chat_id: str, sender_ids: Iterable[str], self_key: str =
         )
         for bot in registry.bots
     )
-
-
-def is_a2a_result_content(content: str) -> bool:
-    return A2A_RESULT_MARKER in (content or "")
-
-
-def is_a2a_request_content(content: str) -> bool:
-    """Only an explicit request marker may start an A2A turn."""
-    value = content or ""
-    return A2A_REQUEST_MARKER in value and A2A_RESULT_MARKER not in value
 
 
 def _native_mention(bot: A2ABot) -> str:

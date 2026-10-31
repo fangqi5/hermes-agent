@@ -4482,7 +4482,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if _is_a2a_enabled_chat(chat_id):
             try:
                 self._peer_discussion_guard.human_turn(chat_id, message_id, content)
-            except (OSError, ValueError, TypeError, KeyError):
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
                 logger.exception("[Feishu] Peer discussion state unavailable; human message still admitted")
         return None
 
