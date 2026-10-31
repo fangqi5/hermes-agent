@@ -1,0 +1,24 @@
+name: Feishu discussion contract
+on:
+  push:
+    branches: [fix/feishu-native-discussion]
+permissions:
+  contents: read
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python scripts/test_feishu_discussion.py -v
+      - run: python -m py_compile plugins/platforms/feishu/a2a.py plugins/platforms/feishu/adapter.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-feishu-discussion
+          path: |
+            plugins/platforms/feishu/a2a.py
+            plugins/platforms/feishu/adapter.py
+          if-no-files-found: error
