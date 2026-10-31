@@ -77,8 +77,6 @@ from plugins.platforms.feishu.a2a import (
     find_peer_by_sender_ids as _find_a2a_peer_by_sender_ids,
     format_outbound as _format_a2a_outbound,
     is_enabled_chat as _is_a2a_enabled_chat,
-    is_a2a_request_content as _is_a2a_request_content,
-    is_a2a_result_content as _is_a2a_result_content,
     mention_targets_bot as _mention_targets_a2a_bot,
 )
 
@@ -1577,10 +1575,14 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
-        # 记录入站 A2A 请求与发送方。回复同一 message_id 时强制改成 RESULT。
-        self._a2a_request_peers: "OrderedDict[str, str]" = OrderedDict()
-        # 普通机器人 @ 可以正常回答，但回复不得原生反向 @，防止无限闲聊。
-        self._a2a_ordinary_peer_messages: "OrderedDict[str, bool]" = OrderedDict()
+        from plugins.platforms.feishu.discussion import PeerDiscussionGuard
+        from plugins.platforms.feishu.a2a import load_registry
+        registry = load_registry()
+        self._peer_discussion_guard = PeerDiscussionGuard(
+            get_hermes_home() / "feishu_peer_discussions.json",
+            max_turns=registry.max_peer_turns,
+            window_seconds=registry.turn_window_seconds,
+        )
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1981,25 +1983,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
-        result_peer_open_id = self._a2a_request_peers.pop(reply_to, None) if reply_to else None
-        ordinary_peer_reply = bool(
-            self._a2a_ordinary_peer_messages.pop(reply_to, None) if reply_to else False
-        )
-        if ordinary_peer_reply:
-            # Keep this as a normal response and do not turn model text into a
-            # native return-mention, otherwise two bots could chat forever.
-            a2a_targets = ()
-        else:
-            formatted, a2a_targets, _a2a_kind = _format_a2a_outbound(
-                formatted,
-                self_key="codex",
-                result_peer_open_id=result_peer_open_id,
-            )
+        formatted, a2a_targets, _ = _format_a2a_outbound(formatted, self_key="codex")
         # Keep the reply relation so the user can see which message was
         # answered, but force bot-to-bot traffic out of topic/thread mode.
         outbound_reply_to = reply_to
         outbound_metadata = metadata
-        if ordinary_peer_reply or result_peer_open_id or a2a_targets:
+        if a2a_targets:
             outbound_metadata = dict(metadata or {})
             outbound_metadata.pop("thread_id", None)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2680,12 +2669,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
 
-        raw_content = str(getattr(message, "content", "") or "")
-        is_a2a_peer_mention = (
-            _is_bot_sender(sender)
-            and self._mentions_self(message)
-            and _is_a2a_request_content(raw_content)
-        )
+        is_a2a_peer_mention = _is_bot_sender(sender) and self._mentions_self(message)
         if is_a2a_peer_mention:
             logger.info(
                 "[Feishu A2A] received peer mention message_id=%s chat_id=%s "
@@ -4464,9 +4448,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 return "bot_not_mentioned"
             if not _allows_a2a_peer_message(chat_id, sender_ids, self_key="codex"):
                 return "bot_not_allowed"
-            content = str(getattr(message, "content", "") or "")
-            if _is_a2a_result_content(content):
-                return "bot_result"
+            # Bot traffic always requires a native mention, even in allow_bots=all.
+            if not is_group or not self._mentions_self(message):
+                return "bot_not_mentioned"
 
         if not is_group:
             if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
@@ -4488,21 +4472,18 @@ class FeishuAdapter(BasePlatformAdapter):
             return "group_policy_rejected"
         if require_mention and not self._mentions_self(message):
             return "group_policy_rejected"
+        content = str(getattr(message, "content", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
         if is_bot:
             peer = _find_a2a_peer_by_sender_ids(sender_ids, self_key="codex")
-            message_id = str(getattr(message, "message_id", "") or "")
-            if peer and message_id:
-                content = str(getattr(message, "content", "") or "")
-                if _is_a2a_request_content(content):
-                    self._a2a_request_peers[message_id] = peer.open_id
-                    self._a2a_request_peers.move_to_end(message_id)
-                    while len(self._a2a_request_peers) > 256:
-                        self._a2a_request_peers.popitem(last=False)
-                else:
-                    self._a2a_ordinary_peer_messages[message_id] = True
-                    self._a2a_ordinary_peer_messages.move_to_end(message_id)
-                    while len(self._a2a_ordinary_peer_messages) > 256:
-                        self._a2a_ordinary_peer_messages.popitem(last=False)
+            if peer is None:
+                return "bot_not_allowed"
+            return self._peer_discussion_guard.admit(chat_id, peer.key, message_id, content)
+        if _is_a2a_enabled_chat(chat_id):
+            try:
+                self._peer_discussion_guard.human_turn(chat_id, message_id, content)
+            except (OSError, ValueError, TypeError, KeyError):
+                logger.exception("[Feishu] Peer discussion state unavailable; human message still admitted")
         return None
 
     def _require_mention_for(self, chat_id: str) -> bool:
