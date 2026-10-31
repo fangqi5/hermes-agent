@@ -71,6 +71,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from plugins.platforms.feishu.a2a import (
+    allows_peer_message as _allows_a2a_peer_message,
+    build_channel_prompt as _build_a2a_channel_prompt,
+    find_peer_by_sender_ids as _find_a2a_peer_by_sender_ids,
+    format_outbound as _format_a2a_outbound,
+    is_enabled_chat as _is_a2a_enabled_chat,
+    mention_targets_bot as _mention_targets_a2a_bot,
+)
+
 # aiohttp/websockets are independent optional deps — import outside lark_oapi
 # so they remain available for tests and webhook mode even if lark_oapi is missing.
 try:
@@ -465,6 +474,8 @@ RejectReason = Literal[
     "self_ids_unknown",
     "bots_disabled",
     "bot_not_mentioned",
+    "bot_not_allowed",
+    "bot_not_request",
     "group_policy_rejected",
 ]
 
@@ -477,14 +488,19 @@ def _is_bot_sender(sender: Any) -> bool:
 def _sender_identity(sender: Any) -> frozenset:
     # Take any non-empty id variant — tenant sender_id_type decides which are populated.
     sid = getattr(sender, "sender_id", None)
-    if sid is None:
-        return frozenset()
-    return frozenset(
-        v for v in (
+    if isinstance(sid, str):
+        sid_values = (sid,)
+    elif sid is None:
+        sid_values = ()
+    else:
+        sid_values = (
             getattr(sid, "open_id", None),
             getattr(sid, "user_id", None),
             getattr(sid, "union_id", None),
+            getattr(sid, "app_id", None),
         )
+    return frozenset(
+        v for v in (*sid_values, getattr(sender, "app_id", None))
         if v
     )
 
@@ -1559,6 +1575,14 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        from plugins.platforms.feishu.discussion import PeerDiscussionGuard
+        from plugins.platforms.feishu.a2a import load_registry
+        registry = load_registry()
+        self._peer_discussion_guard = PeerDiscussionGuard(
+            get_hermes_home() / "feishu_peer_discussions.json",
+            max_turns=registry.max_peer_turns,
+            window_seconds=registry.turn_window_seconds,
+        )
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1816,8 +1840,6 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._connect_with_retry()
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
-            # Plugin-registered native handlers (lark_oapi client).
-            self._wire_plugin_handlers(self._client)
             return True
         except Exception as exc:
             await self._release_app_lock()
@@ -1959,6 +1981,14 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
+        formatted, a2a_targets, _ = _format_a2a_outbound(formatted, self_key="codex")
+        # Keep the reply relation so the user can see which message was
+        # answered, but force bot-to-bot traffic out of topic/thread mode.
+        outbound_reply_to = reply_to
+        outbound_metadata = metadata
+        if a2a_targets:
+            outbound_metadata = dict(metadata or {})
+            outbound_metadata.pop("thread_id", None)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         # When chunking splits a long markdown response, an individual chunk
         # can end up as plain prose that doesn't match the per-chunk hint
@@ -1967,7 +1997,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # client while other chunks render correctly. Lock the markdown
         # decision at the whole-message level so every chunk consistently
         # uses ``post``. See #26841.
-        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
+        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted)) and not a2a_targets
         last_response = None
 
         try:
@@ -1980,8 +2010,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type=msg_type,
                         payload=payload,
-                        reply_to=reply_to,
-                        metadata=metadata,
+                        reply_to=outbound_reply_to,
+                        metadata=outbound_metadata,
                     )
                 except Exception as exc:
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
@@ -1991,8 +2021,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
+                        reply_to=outbound_reply_to,
+                        metadata=outbound_metadata,
                     )
                 if (
                     msg_type == "post"
@@ -2004,8 +2034,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         chat_id=chat_id,
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
+                        reply_to=outbound_reply_to,
+                        metadata=outbound_metadata,
                     )
                 last_response = response
 
@@ -2247,36 +2277,15 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send audio to Feishu as a native voice message (opus) or file.
-
-        Feishu's voice channel only accepts Opus (msg_type='audio' with an
-        opus upload). Non-opus audio (mp3/wav/flac/...) is transcoded on the
-        fly via the shared ffmpeg engine so audio actually arrives as a
-        playable voice message; when ffmpeg is unavailable the original
-        file is sent as a file attachment (previous behavior).
-        """
-        transcoded_path: Optional[str] = None
-        ext = Path(audio_path).suffix.lower()
-        if ext not in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
-            from gateway.platforms.base import transcode_to_ogg_opus
-            transcoded_path = await asyncio.to_thread(transcode_to_ogg_opus, audio_path)
-            if transcoded_path:
-                audio_path = transcoded_path
-        try:
-            return await self._send_uploaded_file_message(
-                chat_id=chat_id,
-                file_path=audio_path,
-                reply_to=reply_to,
-                metadata=metadata,
-                caption=caption,
-                outbound_message_type="audio",
-            )
-        finally:
-            if transcoded_path:
-                try:
-                    os.unlink(transcoded_path)
-                except OSError:
-                    pass
+        """Send audio to Feishu as a file attachment plus optional caption."""
+        return await self._send_uploaded_file_message(
+            chat_id=chat_id,
+            file_path=audio_path,
+            reply_to=reply_to,
+            metadata=metadata,
+            caption=caption,
+            outbound_message_type="audio",
+        )
 
     async def send_document(
         self,
@@ -2637,10 +2646,30 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
 
+        is_a2a_peer_mention = _is_bot_sender(sender) and self._mentions_self(message)
+        if is_a2a_peer_mention:
+            logger.info(
+                "[Feishu A2A] received peer mention message_id=%s chat_id=%s "
+                "sender_type=%s sender_ids=%s",
+                message_id,
+                getattr(message, "chat_id", "") or "",
+                getattr(sender, "sender_type", "") or "",
+                sorted(_sender_identity(sender)),
+            )
+
         reason = self._admit(sender, message)
         if reason is not None:
+            if is_a2a_peer_mention:
+                logger.info(
+                    "[Feishu A2A] rejected peer mention message_id=%s reason=%s",
+                    message_id,
+                    reason,
+                )
             logger.debug("[Feishu] dropping inbound event: %s", reason)
             return
+
+        if is_a2a_peer_mention:
+            logger.info("[Feishu A2A] accepted peer mention message_id=%s", message_id)
 
         chat_type = getattr(message, "chat_type", "p2p")
         await self._process_inbound_message(
@@ -2815,7 +2844,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        if not self._is_interactive_operator_authorized(open_id):
+        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
+        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2874,7 +2904,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        if not self._is_interactive_operator_authorized(open_id):
+        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
+        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
             logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2980,9 +3011,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
-        if not self._is_interactive_operator_authorized(open_id):
-            logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
-            return
+        if open_id:
+            sender_id = SimpleNamespace(open_id=open_id, user_id="")
+            if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+                logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
+                return
         expected_chat_id = str(state.get("chat_id", "") or "")
         if expected_chat_id and chat_id and expected_chat_id != chat_id:
             logger.warning(
@@ -3336,7 +3369,9 @@ class FeishuAdapter(BasePlatformAdapter):
         from gateway.platforms.base import resolve_channel_prompt
         _config = getattr(self, "config", None)
         _extra = getattr(_config, "extra", None) or {}
-        return resolve_channel_prompt(_extra, chat_id, parent_id)
+        configured_prompt = resolve_channel_prompt(_extra, chat_id, parent_id)
+        a2a_prompt = _build_a2a_channel_prompt("codex") if _is_a2a_enabled_chat(chat_id) else ""
+        return "\n\n".join(value for value in (configured_prompt, a2a_prompt) if value) or None
 
     async def _process_inbound_message(
         self,
@@ -3365,7 +3400,11 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # ``root_id`` only describes the reply/reference chain in a regular
+        # chat.  It is not proof that the event came from a Feishu topic.
+        # Only the explicit SDK ``thread_id`` may create a thread-scoped
+        # session or set outbound ``reply_in_thread=true``.
+        thread_id = getattr(message, "thread_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
@@ -3447,7 +3486,6 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=self._session_key_profile(event.source),
         )
         return f"{session_key}:media:{event.message_type.value}"
 
@@ -3756,7 +3794,7 @@ class FeishuAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=self._session_key_profile(event.source),
+            profile=event.source.profile,
         )
 
     @staticmethod
@@ -4388,6 +4426,11 @@ class FeishuAdapter(BasePlatformAdapter):
             # is on; check here only on paths step 4 won't reach.
             if mode == "mentions" and not require_mention and not self._mentions_self(message):
                 return "bot_not_mentioned"
+            if not _allows_a2a_peer_message(chat_id, sender_ids, self_key="codex"):
+                return "bot_not_allowed"
+            # Bot traffic always requires a native mention, even in allow_bots=all.
+            if not is_group or not self._mentions_self(message):
+                return "bot_not_mentioned"
 
         if not is_group:
             if os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
@@ -4409,6 +4452,18 @@ class FeishuAdapter(BasePlatformAdapter):
             return "group_policy_rejected"
         if require_mention and not self._mentions_self(message):
             return "group_policy_rejected"
+        content = str(getattr(message, "content", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        if is_bot:
+            peer = _find_a2a_peer_by_sender_ids(sender_ids, self_key="codex")
+            if peer is None:
+                return "bot_not_allowed"
+            return self._peer_discussion_guard.admit(chat_id, peer.key, message_id, content)
+        if _is_a2a_enabled_chat(chat_id):
+            try:
+                self._peer_discussion_guard.human_turn(chat_id, message_id, content)
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                logger.exception("[Feishu] Peer discussion state unavailable; human message still admitted")
         return None
 
     def _require_mention_for(self, chat_id: str) -> bool:
@@ -4486,20 +4541,33 @@ class FeishuAdapter(BasePlatformAdapter):
         # lacks an ID.
         for mention in mentions:
             mention_id = getattr(mention, "id", None)
-            mention_open_id = (getattr(mention_id, "open_id", None) or "").strip()
-            mention_user_id = (getattr(mention_id, "user_id", None) or "").strip()
+            if isinstance(mention_id, str):
+                mention_raw_id = mention_id.strip()
+                mention_open_id = ""
+                mention_user_id = ""
+                mention_union_id = ""
+                mention_app_id = ""
+            else:
+                mention_raw_id = ""
+                mention_open_id = (getattr(mention_id, "open_id", None) or "").strip()
+                mention_user_id = (getattr(mention_id, "user_id", None) or "").strip()
+                mention_union_id = (getattr(mention_id, "union_id", None) or "").strip()
+                mention_app_id = (getattr(mention_id, "app_id", None) or "").strip()
             mention_name = (getattr(mention, "name", None) or "").strip()
 
-            if mention_open_id and self._bot_open_id:
-                if mention_open_id == self._bot_open_id:
-                    return True
-                continue  # IDs differ — not the bot; skip name fallback.
-            if mention_user_id and self._bot_user_id:
-                if mention_user_id == self._bot_user_id:
-                    return True
-                continue
-            if self._bot_name and mention_name == self._bot_name:
+            if mention_open_id and self._bot_open_id and mention_open_id == self._bot_open_id:
                 return True
+            if mention_user_id and self._bot_user_id and mention_user_id == self._bot_user_id:
+                return True
+            if _mention_targets_a2a_bot(
+                (mention_raw_id, mention_open_id, mention_user_id, mention_union_id, mention_app_id),
+                mention_name,
+                self_key=os.getenv("FEISHU_A2A_SELF", "codex").strip() or "codex",
+            ):
+                return True
+            if not any((mention_raw_id, mention_open_id, mention_user_id, mention_union_id, mention_app_id)):
+                if self._bot_name and mention_name == self._bot_name:
+                    return True
 
         return False
 
@@ -4671,6 +4739,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # markdown document: when a long markdown reply is split at
         # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
         # mis-classify a plain-prose chunk as ``text``. See #26841.
+        # 飞书只有原生 text/post 的 at 标签会真正触发另一个机器人；
+        # Card/markdown 渲染里的 @ 只是视觉文本，不能用于 A2A。
+        if '<at user_id="' in content:
+            return "text", json.dumps({"text": content}, ensure_ascii=False)
         if prefer_post or _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
